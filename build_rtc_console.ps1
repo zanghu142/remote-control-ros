@@ -6,6 +6,8 @@ param(
     [string]$Configuration,
     [string]$BuildDirectory,
     [string]$InstallDirectory,
+    [ValidateSet('Auto', '2022', '2026')]
+    [string]$VisualStudioVersion,
     [switch]$SkipTests
 )
 

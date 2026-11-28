@@ -13,7 +13,7 @@ console 不是 ROS 节点，不运行本地推理；它通过 `perception.fused.
 
 ## Windows 构建与运行
 
-支持 Windows 10（1903 或更新）/11 x64、Visual Studio 2026（安装“使用 C++ 的桌面开发”和 Windows SDK）、CMake 4.2 或更高版本。
+支持 Windows 10（1903 或更新）/11 x64、Visual Studio 2022 或 2026（安装“使用 C++ 的桌面开发”和 Windows SDK）。VS 2022 使用 CMake 3.24 或更高版本，VS 2026 使用 CMake 4.2 或更高版本。
 Windows 不需要 ROS、ament、colcon 或 Jetson 开发环境。编译需要 CUDA Toolkit（验证版本 12.6）和 NVIDIA Video Codec SDK 11.0.10。RTC SDK、音频和共享协议均从本仓库源码编译。
 
 先按 [Windows 开发包说明](../../../vendor/windows/README.md) 准备匹配的 WebRTC 和 Video Codec SDK。
@@ -24,6 +24,9 @@ Windows 不需要 ROS、ament、colcon 或 Jetson 开发环境。编译需要 CU
 
 ```powershell
 .\build_rtc_console.ps1
+# 手动选择 VS 版本；不同版本使用不同构建目录：
+.\build_rtc_console.ps1 -VisualStudioVersion 2022 -BuildDirectory build/windows-console-vs2022
+.\build_rtc_console.ps1 -VisualStudioVersion 2026 -BuildDirectory build/windows-console-vs2026
 # 开发包在其它位置时：
 .\build_rtc_console.ps1 -WebRtcRoot D:\deps\webrtc-win -NvCodecRoot D:\deps\Video_Codec_SDK_11.0.10
 .\install\windows-console\bin\rtc_console.exe --help
@@ -33,6 +36,10 @@ Windows 不需要 ROS、ament、colcon 或 Jetson 开发环境。编译需要 CU
 脚本默认编译 Release、运行测试并安装到 `install/windows-console/bin/`。可以传入
 `-Configuration Debug` 或 `-Configuration RelWithDebInfo`、`-BuildDirectory`、`-InstallDirectory`；
 `-SkipTests` 仅跳过执行测试。脚本不会自动启动 RTC 会话。
+`-VisualStudioVersion Auto` 为默认值：已有构建目录沿用缓存中的 VS 2022／2026；
+新目录优先使用已安装且当前 CMake 支持的 VS 2022，否则使用 VS 2026。
+脚本通过 Visual Studio Installer 检测完整安装的 C++ 工具，Build Tools 版本也适用。
+在 VS 2026 中单独安装 v143 组件不等于安装 VS 2022。
 
 首次 CMake 配置通过 HTTPS 获取固定版本并校验 SHA-256：SDL 3.4.12、ImGui 1.92.6、
 nlohmann/json 3.12.0、nanopb 0.4.9、Asio 1.32.0、spdlog 1.14.1、Protobuf 3.21.12。
@@ -44,14 +51,15 @@ Protobuf 编译器随构建生成，不要求预装 Python 或 protoc。
 
 ```powershell
 cmake -S src/remote_drive/dozer_rtc_console -B build/windows-console `
-  -G "Visual Studio 18 2026" -A x64 -DDOZER_WEBRTC_ROOT=D:/deps/webrtc-win `
+  -G "Visual Studio 17 2022" -A x64 -DDOZER_WEBRTC_ROOT=D:/deps/webrtc-win `
   -DDOZER_NVCODEC_ROOT=D:/deps/Video_Codec_SDK_11.0.10 -DBUILD_TESTING=ON
 cmake --build build/windows-console --config Release --parallel
 ctest --test-dir build/windows-console -C Release --output-on-failure
 cmake --install build/windows-console --config Release --prefix install/windows-console --component Runtime
 ```
 
-若构建目录曾使用 VS 2022，先在上述配置命令中添加 `--fresh` 重新生成 CMake 缓存，或用 `-BuildDirectory` 指定新的构建目录。
+直接使用 VS 2026 时，将生成器换为 `Visual Studio 18 2026`。
+构建目录中的 CMake 生成器必须一致；跨 VS 版本时用 `-BuildDirectory` 指定新目录，脚本会检查并提示缓存冲突。
 
 构建目录中的入口为 `build/windows-console/bin/Release/rtc_console.exe`。
 交付时复制整个安装目录（`bin/` 包含 EXE、`vtsrtc.dll`、`rtc.cfg`、`console.cfg`，`share/licenses/` 保存第三方许可证），
