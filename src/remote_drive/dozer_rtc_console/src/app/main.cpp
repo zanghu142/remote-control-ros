@@ -41,6 +41,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -653,7 +654,9 @@ class RtcConsoleApp {
           auto calibration = std::make_unique<rtc_console::StereoFisheyeCalibration>(
               rtc_console::LoadSingleFisheyeCalibration(calibration_path(entry.second)));
           const auto& crop = calibration->valid_crop;
-          AppendLog(std::string("环视鱼眼标定已加载：") + entry.first + "，中心保留 " +
+          AppendLog(std::string("环视鱼眼标定已加载：") + entry.first + "，文件=" +
+              calibration_path(entry.second) + "，标定尺寸=" +
+              std::to_string(calibration->width) + "x" + std::to_string(calibration->height) + "，中心保留 " +
               std::to_string(static_cast<int>(std::lround((crop[2] - crop[0]) * 100))) + "%");
           surround_fisheye_calibrations_.emplace(entry.first, std::move(calibration));
         } catch (const std::exception& error) {
@@ -3779,17 +3782,39 @@ class RtcConsoleApp {
 #endif
   }
 
+  bool FisheyeMatchesFrame(const rtc_console::StereoFisheyeCalibration* calibration,
+                           const VideoFrameView& frame, int columns, int rows) const {
+#if defined(_WIN32)
+    if (!calibration || columns <= 0 || rows <= 0) return false;
+    size_t width = frame.width, height = frame.height;
+    const auto texture = video_textures_.find(frame.stream_key);
+    if (texture != video_textures_.end() && texture->second.texture != 0) {
+      width = static_cast<size_t>(texture->second.width);
+      height = static_cast<size_t>(texture->second.height);
+    }
+    if (width > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        height > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        width % columns != 0 || height % rows != 0) return false;
+    return rtc_console::FisheyeResolutionMatches(*calibration,
+        static_cast<int>(width / columns), static_cast<int>(height / rows));
+#else
+    return false;
+#endif
+  }
+
   bool UseFisheyeForFrame(const VideoFrameView& frame) const {
 #if defined(_WIN32)
     if (!fisheye_renderer_.Error().empty() || frame.width == 0 || frame.height == 0) return false;
     if (frame.source_id == kExternalVideoSource)
-      return render_fisheye_ && fisheye_calibration_ && frame.width >= 2 && frame.width % 2 == 0;
+      return render_fisheye_ && FisheyeMatchesFrame(fisheye_calibration_.get(), frame, 2, 1);
     if (!render_surround_fisheye_) return false;
-    if (frame.source_id == "surround_grid")
-      return !surround_fisheye_calibrations_.empty() && frame.width >= 2 && frame.height >= 2 &&
-          frame.width % 2 == 0 && frame.height % 2 == 0;
+    if (frame.source_id == "surround_grid") {
+      for (const auto& calibration : surround_fisheye_calibrations_)
+        if (FisheyeMatchesFrame(calibration.second.get(), frame, 2, 2)) return true;
+      return false;
+    }
     return frame.source_id.find("surround_") == 0 &&
-        SurroundFisheye(frame.source_id.substr(9)) != nullptr;
+        FisheyeMatchesFrame(SurroundFisheye(frame.source_id.substr(9)), frame, 1, 1);
 #else
     return false;
 #endif
@@ -3806,7 +3831,7 @@ class RtcConsoleApp {
     }
     if (frame.source_id != "surround_grid") {
       const auto* calibration = SurroundFisheye(frame.source_id.substr(9));
-      if (!calibration) {
+      if (!calibration || !rtc_console::FisheyeResolutionMatches(*calibration, texture_width, texture_height)) {
         list->AddImage(texture, min, max, uv_min, uv_max);
         return false;
       }
@@ -3829,7 +3854,8 @@ class RtcConsoleApp {
                       min.y + (uv.y - uv_min.y) / (uv_max.y - uv_min.y) * (max.y - min.y));
       };
       const auto* calibration = SurroundFisheye(kSurroundCameraNames[index]);
-      if (!calibration) {
+      if (!calibration || !rtc_console::FisheyeResolutionMatches(*calibration,
+          texture_width / 2, texture_height / 2)) {
         list->AddImage(texture, position(clipped_min), position(clipped_max), clipped_min, clipped_max);
         continue;
       }
@@ -3846,11 +3872,13 @@ class RtcConsoleApp {
 #if defined(_WIN32)
     const rtc_console::StereoFisheyeCalibration* selected = nullptr;
     int eye = 0;
+    int columns = 1, rows = 1;
     double origin_x = 0, origin_y = 0, region_width = 1, region_height = 1;
     if (frame.source_id == kExternalVideoSource) {
       selected = fisheye_calibration_.get();
       eye = (rect->left + rect->right) * 0.5f >= 0.5f ? 1 : 0;
       region_width = 0.5;
+      columns = 2;
       origin_x = eye * 0.5;
     } else if (frame.source_id == "surround_grid") {
       const int column = std::clamp(static_cast<int>(rect->left + rect->right), 0, 1);
@@ -3858,11 +3886,12 @@ class RtcConsoleApp {
       selected = SurroundFisheye(kSurroundCameraNames[row * 2 + column]);
       origin_x = column * 0.5; origin_y = row * 0.5;
       region_width = region_height = 0.5;
+      columns = rows = 2;
     } else if (frame.source_id.find("surround_") == 0) {
       selected = SurroundFisheye(frame.source_id.substr(9));
     }
     // A missing camera calibration falls back to raw rendering and raw overlays.
-    if (!selected) return true;
+    if (!FisheyeMatchesFrame(selected, frame, columns, rows)) return true;
     const auto& calibration = *selected;
     const NormalizedRect source{
         static_cast<float>(std::max<double>(rect->left, origin_x)),
@@ -3909,7 +3938,9 @@ class RtcConsoleApp {
                               int render_width_pixels, int render_height_pixels) {
 #endif
     if (frame.buffer.empty() || frame.width == 0 || frame.height == 0 ||
-        frame.dimension < 4) {
+        frame.dimension != 4 || frame.width > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        frame.height > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        frame.width > std::numeric_limits<size_t>::max() / frame.height / frame.dimension) {
       return;
     }
 
@@ -4785,6 +4816,11 @@ class RtcConsoleApp {
     if (!sourceid || !buffer || width == 0 || height == 0 || sz_buffer == 0) {
       return;
     }
+    if (dimension != 4 || width > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        height > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        width > std::numeric_limits<size_t>::max() / height / dimension) return;
+    const size_t expected_bytes = width * height * dimension;
+    if (sz_buffer < expected_bytes) return;
     auto view = std::make_shared<VideoFrameView>();
     view->stream_key = MakeVideoStreamKey(remote_sessionid, sourceid);
     view->source_id = sourceid;
@@ -4794,7 +4830,7 @@ class RtcConsoleApp {
     view->height = height;
     view->dimension = dimension;
     view->frame_seq = instance_->remote_video_frame_seq_.fetch_add(1) + 1;
-    view->buffer.assign(buffer, buffer + sz_buffer);
+    view->buffer.assign(buffer, buffer + expected_bytes);
 
     {
       std::lock_guard<std::mutex> lock(instance_->video_mutex_);

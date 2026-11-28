@@ -108,6 +108,50 @@ void ValidateEye(const FisheyeEye& eye) {
       std::abs(eye.camera[6]) > 1e-8 || std::abs(eye.camera[7]) > 1e-8 ||
       std::abs(eye.camera[8] - 1) > 1e-8)
     throw std::runtime_error("Invalid fisheye camera intrinsics");
+  if (std::abs(eye.projection[1]) > 1e-8 || std::abs(eye.projection[4]) > 1e-8 ||
+      std::abs(eye.projection[8]) > 1e-8 || std::abs(eye.projection[9]) > 1e-8 ||
+      std::abs(eye.projection[10] - 1) > 1e-8 || std::abs(eye.projection[11]) > 1e-8)
+    throw std::runtime_error("Unsupported fisheye projection matrix");
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      double dot = 0;
+      for (int k = 0; k < 3; ++k) dot += eye.rotation[row * 3 + k] * eye.rotation[col * 3 + k];
+      if (std::abs(dot - (row == col ? 1.0 : 0.0)) > 1e-5)
+        throw std::runtime_error("Fisheye rectification rotation must be orthonormal");
+    }
+  }
+  const auto& r = eye.rotation;
+  const double determinant = r[0]*(r[4]*r[8]-r[5]*r[7]) -
+      r[1]*(r[3]*r[8]-r[5]*r[6]) + r[2]*(r[3]*r[7]-r[4]*r[6]);
+  if (std::abs(determinant - 1) > 1e-5)
+    throw std::runtime_error("Fisheye rectification rotation must preserve orientation");
+}
+
+template <typename T>
+double DistortedTheta(const std::array<T, 4>& d, double theta) {
+  const double t2 = theta * theta;
+  return theta * (1 + t2 * (d[0] + t2 * (d[1] + t2 * (d[2] + t2 * d[3]))));
+}
+
+template <typename T>
+double DistortedThetaDerivative(const std::array<T, 4>& d, double theta) {
+  const double t2 = theta * theta;
+  return 1 + t2 * (3*d[0] + t2 * (5*d[1] + t2 * (7*d[2] + t2 * 9*d[3])));
+}
+
+template <typename T>
+double MonotonicThetaLimit(const std::array<T, 4>& d) {
+  // Work only on the first invertible radial branch. A non-monotonic model can
+  // fold distant pixels over the center even though all projected values fit.
+  constexpr double maximum = 1.5706963267948966;
+  constexpr int samples = 4096;
+  for (int i = 1; i <= samples; ++i) {
+    const double theta = maximum * i / samples;
+    const double derivative = DistortedThetaDerivative(d, theta);
+    if (!std::isfinite(derivative) || derivative <= 1e-6)
+      return maximum * (i - 1) / samples;
+  }
+  return maximum;
 }
 
 std::array<double, 9> Inverse(const std::array<double, 9>& m) {
@@ -122,17 +166,18 @@ std::array<double, 9> Inverse(const std::array<double, 9>& m) {
            (m[0]*m[4]-m[1]*m[3])/determinant}};
 }
 
-bool ValidSourcePixel(const FisheyeUniforms& u, double x, double y, int width, int height) {
+bool ValidSourcePixel(const FisheyeUniforms& u, double theta_limit,
+                      double x, double y, int width, int height) {
   const auto& h = u.rectified_to_ray;
   const double z = h[2] * x + h[5] * y + h[8];
   if (z <= 1e-12) return false;
   const double a = (h[0] * x + h[3] * y + h[6]) / z;
   const double b = (h[1] * x + h[4] * y + h[7]) / z;
   const double radius = std::hypot(a, b);
-  const double theta = std::atan(radius), t2 = theta * theta;
+  const double theta = std::atan(radius);
+  if (!std::isfinite(theta) || theta >= theta_limit) return false;
   const auto& d = u.distortion;
-  const double scale = radius < 1e-12 ? 1.0 : theta *
-      (1 + t2 * (d[0] + t2 * (d[1] + t2 * (d[2] + t2 * d[3])))) / radius;
+  const double scale = radius < 1e-12 ? 1.0 : DistortedTheta(d, theta) / radius;
   const double source_x = u.intrinsics[0] * a * scale + u.intrinsics[2];
   const double source_y = u.intrinsics[1] * b * scale + u.intrinsics[3];
   // Leave a sampling margin inside each eye for bilinear filtering, floating
@@ -147,6 +192,8 @@ bool ValidSourcePixel(const FisheyeUniforms& u, double x, double y, int width, i
 std::array<float, 4> CommonValidCrop(const StereoFisheyeCalibration& calibration) {
   const auto left = MakeFisheyeUniforms(calibration, 0, calibration.width, calibration.height);
   const auto right = MakeFisheyeUniforms(calibration, 1, calibration.width, calibration.height);
+  const double left_limit = left.max_theta;
+  const double right_limit = right.max_theta;
   const int columns = std::min(calibration.width, 1024);
   const int rows = std::min(calibration.height, 1024);
   double scale = 1.0;
@@ -161,8 +208,8 @@ std::array<float, 4> CommonValidCrop(const StereoFisheyeCalibration& calibration
       if (distance >= scale) continue;
       const double x = u * calibration.width - 0.5;
       const double y = v * calibration.height - 0.5;
-      if (!ValidSourcePixel(left, x, y, calibration.width, calibration.height) ||
-          !ValidSourcePixel(right, x, y, calibration.width, calibration.height))
+      if (!ValidSourcePixel(left, left_limit, x, y, calibration.width, calibration.height) ||
+          !ValidSourcePixel(right, right_limit, x, y, calibration.width, calibration.height))
         scale = distance;
     }
   }
@@ -192,6 +239,7 @@ StereoFisheyeCalibration LoadStereoFisheyeCalibration(const std::string& path) {
     eye.rotation = ReadMatrix<3, 3>(root, i == 0 ? "R1" : "R2");
     eye.projection = ReadMatrix<3, 4>(root, i == 0 ? "P1" : "P2");
     ValidateEye(eye);
+    eye.max_theta = MonotonicThetaLimit(eye.distortion);
     // Validate matrix invertibility before the first received frame.
     MakeFisheyeUniforms(result, i, result.width, result.height);
   }
@@ -217,10 +265,19 @@ StereoFisheyeCalibration LoadSingleFisheyeCalibration(const std::string& path) {
     for (int col = 0; col < 3; ++col)
       eye.projection[row * 4 + col] = projection[row * 3 + col];
   ValidateEye(eye);
+  eye.max_theta = MonotonicThetaLimit(eye.distortion);
   MakeFisheyeUniforms(result, 0, result.width, result.height);
   result.eyes[1] = eye;
   result.valid_crop = CommonValidCrop(result);
   return result;
+}
+
+bool FisheyeResolutionMatches(const StereoFisheyeCalibration& calibration, int width, int height) {
+  if (width <= 0 || height <= 0 || calibration.width <= 0 || calibration.height <= 0) return false;
+  const double x_scale = static_cast<double>(width) / calibration.width;
+  const double y_scale = static_cast<double>(height) / calibration.height;
+  // Permit pixel rounding but reject cropped/rotated/stretched video modes.
+  return std::abs(x_scale / y_scale - 1) <= 0.001;
 }
 
 FisheyeUniforms MakeFisheyeUniforms(const StereoFisheyeCalibration& calibration,
@@ -249,6 +306,14 @@ FisheyeUniforms MakeFisheyeUniforms(const StereoFisheyeCalibration& calibration,
       static_cast<float>(eye.camera[5] * sy)}};
   for (size_t i = 0; i < eye.distortion.size(); ++i)
     result.distortion[i] = static_cast<float>(eye.distortion[i]);
+  result.max_theta = static_cast<float>(std::min(eye.max_theta,
+      MonotonicThetaLimit(result.distortion)));
+  for (float value : result.rectified_to_ray)
+    if (!std::isfinite(value)) throw std::runtime_error("Fisheye mapping exceeds GPU precision");
+  for (float value : result.intrinsics)
+    if (!std::isfinite(value)) throw std::runtime_error("Fisheye intrinsics exceed GPU precision");
+  for (float value : result.distortion)
+    if (!std::isfinite(value)) throw std::runtime_error("Fisheye distortion exceeds GPU precision");
   return result;
 }
 
@@ -257,20 +322,23 @@ bool FisheyeRectifiedPoint(const FisheyeEye& eye, double x, double y,
   const double a = (x - eye.camera[2]) / eye.camera[0];
   const double b = (y - eye.camera[5]) / eye.camera[4];
   const double distorted_theta = std::hypot(a, b);
-  double theta = std::min(distorted_theta, 1.5);
   const auto& d = eye.distortion;
-  for (int i = 0; i < 30; ++i) {
-    const double t2 = theta * theta;
-    const double f = theta * (1 + t2*(d[0]+t2*(d[1]+t2*(d[2]+t2*d[3])))) - distorted_theta;
-    const double df = 1 + t2*(3*d[0]+t2*(5*d[1]+t2*(7*d[2]+t2*9*d[3])));
-    if (std::abs(df) < 1e-12) return false;
-    const double delta = f / df;
-    theta -= delta;
-    if (std::abs(delta) < 1e-10) break;
+  if (!std::isfinite(distorted_theta)) return false;
+  // Safeguarded Newton iteration: keep each step in the physical angular
+  // interval, falling back to bisection instead of jumping across radial folds.
+  double low = 0, high = eye.max_theta;
+  if (distorted_theta > DistortedTheta(d, high)) return false;
+  double theta = std::min(distorted_theta, high);
+  for (int i = 0; i < 40; ++i) {
+    const double f = DistortedTheta(d, theta) - distorted_theta;
+    if (std::abs(f) < 1e-10) break;
+    if (f > 0) high = theta; else low = theta;
+    const double derivative = DistortedThetaDerivative(d, theta);
+    const double next = derivative > 1e-6 ? theta - f / derivative : -1;
+    theta = std::isfinite(next) && next > low && next < high ? next : (low + high) * 0.5;
   }
-  const double t2 = theta * theta;
-  const double residual = theta * (1+t2*(d[0]+t2*(d[1]+t2*(d[2]+t2*d[3])))) - distorted_theta;
-  if (theta < 0 || theta >= 1.57079632679 || std::abs(residual) > 1e-7) return false;
+  if (theta < 0 || theta > eye.max_theta ||
+      std::abs(DistortedTheta(d, theta) - distorted_theta) > 1e-7) return false;
   const double scale = distorted_theta < 1e-12 ? 1.0 : std::tan(theta) / distorted_theta;
   const double ray[3] = {a * scale, b * scale, 1};
   double rotated[3]{};

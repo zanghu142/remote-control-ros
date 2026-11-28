@@ -43,6 +43,7 @@ uniform vec4 KLeft;
 uniform vec4 KRight;
 uniform vec4 DLeft;
 uniform vec4 DRight;
+uniform vec2 MaxTheta;
 in vec2 Frag_UV;
 in vec4 Frag_Color;
 out vec4 Out_Color;
@@ -86,15 +87,21 @@ void main() {
   vec4 k = rightEye ? KRight : KLeft;
   vec4 d = rightEye ? DRight : DLeft;
   vec3 ray = h * vec3(uv * EyeSize - vec2(0.5), 1.0);
-  if (ray.z <= 0.0) { Out_Color = vec4(0, 0, 0, Frag_Color.a); return; }
+  if (any(isnan(ray)) || any(isinf(ray)) || ray.z <= 0.0000001) {
+    Out_Color = vec4(0, 0, 0, Frag_Color.a); return;
+  }
   vec2 plane = ray.xy / ray.z;
   float r = length(plane);
   float theta = atan(r);
+  if (isnan(theta) || isinf(theta) || theta >= (rightEye ? MaxTheta.y : MaxTheta.x)) {
+    Out_Color = vec4(0, 0, 0, Frag_Color.a); return;
+  }
   float t2 = theta * theta;
   float scale = r < 0.000001 ? 1.0 : theta *
       (1.0 + t2 * (d.x + t2 * (d.y + t2 * (d.z + t2 * d.w)))) / r;
   vec2 pixel = k.xy * plane * scale + k.zw;
-  if (any(lessThan(pixel, vec2(-0.5))) || any(greaterThanEqual(pixel, EyeSize - vec2(0.5)))) {
+  if (any(isnan(pixel)) || any(isinf(pixel)) ||
+      any(lessThan(pixel, vec2(-0.5))) || any(greaterThanEqual(pixel, EyeSize - vec2(0.5)))) {
     Out_Color = vec4(0, 0, 0, Frag_Color.a); return;
   }
   // Clamp INSIDE the selected eye, so bilinear filtering never crosses the seam.
@@ -145,7 +152,7 @@ struct StereoFisheyeRenderer::Impl {
   enum Uniform {
     Projection, Texture, Interleave, CorrectFisheye, SingleCamera, SourceRegion,
     DrawWidth, DrawHeight, EyeSize, Crop, ValidCrop, RayLeft, RayRight,
-    KLeft, KRight, DLeft, DRight, UniformCount
+    KLeft, KRight, DLeft, DRight, MaxTheta, UniformCount
   };
   std::array<GLint, UniformCount> locations{};
   struct Mapping {
@@ -212,7 +219,8 @@ struct StereoFisheyeRenderer::Impl {
       }
       const char* names[] = {"ProjMtx", "Texture", "Interleave", "CorrectFisheye",
           "SingleCamera", "SourceRegion", "DrawWidth", "DrawHeight", "EyeSize",
-          "Crop", "ValidCrop", "RayLeft", "RayRight", "KLeft", "KRight", "DLeft", "DRight"};
+          "Crop", "ValidCrop", "RayLeft", "RayRight", "KLeft", "KRight", "DLeft", "DRight", "MaxTheta"};
+      static_assert(sizeof(names) / sizeof(names[0]) == UniformCount, "Shader uniform table mismatch");
       for (size_t i = 0; i < locations.size(); ++i) {
         locations[i] = GetUniformLocation(program, names[i]);
         if (locations[i] < 0) throw std::runtime_error(std::string("Missing shader uniform: ") + names[i]);
@@ -251,6 +259,7 @@ struct StereoFisheyeRenderer::Impl {
       gl.Uniform4f(location[Crop], draw.uv_min.x, draw.uv_min.y,
                    draw.uv_max.x, draw.uv_max.y);
       if (draw.mapping) {
+        gl.Uniform2f(location[MaxTheta], draw.mapping->eyes[0].max_theta, draw.mapping->eyes[1].max_theta);
         gl.Uniform4fv(location[ValidCrop], 1, draw.mapping->crop.data());
         for (int i = 0; i < 2; ++i) {
           gl.UniformMatrix3fv(location[i == 0 ? RayLeft : RayRight], 1, GL_FALSE,
@@ -288,6 +297,11 @@ void StereoFisheyeRenderer::DrawImage(ImDrawList* list, ImTextureID texture,
     bool single_camera, std::array<float, 4> source_region) {
   const auto* viewport = ImGui::GetMainViewport();
   if (width <= 0 || height <= 0 || viewport->Size.x <= 0 || viewport->Size.y <= 0) return;
+  if (calibration && !FisheyeResolutionMatches(*calibration, width, height)) {
+    // Keep the original geometry when a stream does not match calibration FOV.
+    list->AddImage(texture, min, max, uv_min, uv_max);
+    return;
+  }
   auto& draw = impl_->draws.emplace_back();
   draw.owner = impl_.get();
   draw.width = width;
