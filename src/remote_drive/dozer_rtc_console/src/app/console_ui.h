@@ -38,6 +38,7 @@ inline const char* SettingLabel(const std::string& key) {
 inline const char* ActionLabel(const std::string& key) {
   static const struct { const char* key; const char* label; } labels[] = {
       {"toggle_interleave", "切换像素交错显示"}, {"toggle_view", "切换双目与环视"},
+      {"toggle_fisheye", "切换原始／鱼眼矫正画面"},
       {"select_1", "选择设备／画面 1"}, {"select_2", "选择设备／画面 2"},
       {"select_3", "选择设备／画面 3"}, {"select_4", "选择设备／画面 4"},
       {"takeover", "接管设备"}, {"release_takeover", "停止并退出接管"},

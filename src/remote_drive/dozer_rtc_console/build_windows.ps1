@@ -20,7 +20,7 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
 }
 
 $configure = @('-S', $PSScriptRoot, '-B', $BuildDirectory,
-    '-G', 'Visual Studio 17 2022', '-A', 'x64', '-DBUILD_TESTING=ON')
+    '-G', 'Visual Studio 18 2026', '-A', 'x64', '-DBUILD_TESTING=ON')
 if ($WebRtcRoot) { $configure += "-DDOZER_WEBRTC_ROOT=$WebRtcRoot" }
 if ($NvCodecRoot) { $configure += "-DDOZER_NVCODEC_ROOT=$NvCodecRoot" }
 Invoke-Checked 'cmake' $configure

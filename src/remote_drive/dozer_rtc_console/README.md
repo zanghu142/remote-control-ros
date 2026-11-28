@@ -13,7 +13,7 @@ console 不是 ROS 节点，不运行本地推理；它通过 `perception.fused.
 
 ## Windows 构建与运行
 
-支持 Windows 10（1903 或更新）/11 x64、Visual Studio 2022（安装“使用 C++ 的桌面开发”和 Windows SDK）、CMake 3.24 或更高版本。
+支持 Windows 10（1903 或更新）/11 x64、Visual Studio 2026（安装“使用 C++ 的桌面开发”和 Windows SDK）、CMake 4.2 或更高版本。
 Windows 不需要 ROS、ament、colcon 或 Jetson 开发环境。编译需要 CUDA Toolkit（验证版本 12.6）和 NVIDIA Video Codec SDK 11.0.10。RTC SDK、音频和共享协议均从本仓库源码编译。
 
 先按 [Windows 开发包说明](../../../vendor/windows/README.md) 准备匹配的 WebRTC 和 Video Codec SDK。
@@ -44,17 +44,82 @@ Protobuf 编译器随构建生成，不要求预装 Python 或 protoc。
 
 ```powershell
 cmake -S src/remote_drive/dozer_rtc_console -B build/windows-console `
-  -G "Visual Studio 17 2022" -A x64 -DDOZER_WEBRTC_ROOT=D:/deps/webrtc-win `
+  -G "Visual Studio 18 2026" -A x64 -DDOZER_WEBRTC_ROOT=D:/deps/webrtc-win `
   -DDOZER_NVCODEC_ROOT=D:/deps/Video_Codec_SDK_11.0.10 -DBUILD_TESTING=ON
 cmake --build build/windows-console --config Release --parallel
 ctest --test-dir build/windows-console -C Release --output-on-failure
 cmake --install build/windows-console --config Release --prefix install/windows-console --component Runtime
 ```
 
+若构建目录曾使用 VS 2022，先在上述配置命令中添加 `--fresh` 重新生成 CMake 缓存，或用 `-BuildDirectory` 指定新的构建目录。
+
 构建目录中的入口为 `build/windows-console/bin/Release/rtc_console.exe`。
 交付时复制整个安装目录（`bin/` 包含 EXE、`vtsrtc.dll`、`rtc.cfg`、`console.cfg`，`share/licenses/` 保存第三方许可证），
 目标机需安装 x64 Visual C++ 2015–2022 Redistributable 和支持 H.264 NVDEC 的 NVIDIA 显卡驱动，无需 CUDA Toolkit 或开发机 PATH。配置放在 EXE 旁，也可通过 `--config` 指定。
 Windows 默认 `use_NVDEC=true`：接收端协商 H.264，经 NVIDIA NVDEC 解码并转为 I420 交给显示模块。驱动或硬件初始化失败会报错，不会静默切换为软件解码。需要对照排查时，才显式设置 `use_NVDEC=false` 使用 WebRTC 内置解码器。发送端编码仍使用 WebRTC 内置编码器。
+
+### Windows 双目与环视鱼眼矫正
+
+Windows 客户端使用 OpenGL GPU 着色器对 `stereo` 左右拼接视频分别去畸变和校正极线，
+采用标定文件中的 `K/D/R1/R2/P1/P2`，再进行显示或逐列像素交错。
+四路环视各自读取 `camera_matrix`、`dist_coeffs`、`new_camera_matrix` 做单目去畸变，
+按前、后、左、右分别应用到 `surround_grid` 的对应格子以及 `surround_front/rear/left/right` 单路视频。
+四宫格、单路放大与全屏使用相同参数，GPU 采样限制在对应格子内部，检测框同步变换。
+每路环视独立计算有效中心裁剪区域，自动去除矫正黑边。
+Windows 每路视频只上传原始纹理，每次界面刷新中最多上传一次；普通视图、全屏和单眼裁剪
+共享原始纹理，原始交错与矫正交错都在 GPU 完成，不再生成 CPU 交错图像。
+标定映射按标定对象和接收分辨率缓存，着色器参数位置只在初始化时查询。
+SDK 回调提供临时 CPU 图像，因此客户端仍需一次帧数据复制和一次纹理上传，并非端到端零拷贝。
+普通视图与全屏使用相同的矫正流程；接收分辨率变化时按每眼宽高缩放内参和投影矩阵。
+标定尺寸 `1920×1080` 指单眼，输入顺序为左眼在左、右眼在右。应使用同一对摄像头、
+相同视场的画面；裁剪或更换镜头后应重新标定。
+
+矫正时根据标定参数自动裁去边缘无效黑区，左右眼使用同一中心矩形并等比例放大，
+保持双目极线对齐和画面比例。并排、像素交错及全屏均使用这一裁剪范围；
+检测框同步映射到裁剪后的坐标。裁剪会减少边缘视野，按 `F` 可切回完整原始画面。
+窗口与双目视频宽高比不同产生的外侧留白仍用于保持画面比例。
+
+默认按 `F` 同时切换双目和环视的原始画面／矫正画面，按 `I` 切换双目的左右并排／逐列交错。
+两种开关相互独立，支持原始并排、原始交错、矫正并排、矫正交错。
+双目并排时，双击左眼或右眼可分别全屏放大；再次双击或按 `Esc` 返回。
+在双目全屏中继续双击某一眼，返回时恢复双目全屏。单眼放大使用对应鱼眼参数，
+保持该眼比例，并暂停像素交错显示；返回双目后恢复原交错开关状态。
+交错模式中双击仍放大完整交错画面，可先按 `I` 切回并排以选择单眼。
+设置 → 快捷键中的“切换原始／鱼眼矫正画面”可修改 `F`；保存后重启生效。
+临时切换不会改写启动默认值，可在设置 → 常规中分别修改双目和环视的启动矫正开关及标定路径。
+
+五份标定源文件统一放在 `src/system/dozer_bringup/config/`，与 `camera.yaml`、`extrinsics.yaml` 同级：
+`stereo_fisheye_extrinsics.yml`、`surround_front_fisheye.yml`、`surround_rear_fisheye.yml`、
+`surround_left_fisheye.yml`、`surround_right_fisheye.yml`。每次构建操作台时自动将它们复制到
+`build/windows-console/bin/Release/fisheye_calibration/`；其它构建配置也会复制到对应 EXE 目录。
+更新标定后再次编译即可同步，即使 EXE 无需重新链接也会执行复制。
+安装后位于 `install/windows-console/bin/fisheye_calibration/`。
+客户端直接读取 OpenCV YAML 标定中的矩阵、科学计数法及多行数组，不要求安装 OpenCV。
+`console.cfg` 中的配置为：
+
+```json
+"stereo_fisheye": {
+  "enabled": true,
+  "calibration_file": "fisheye_calibration/stereo_fisheye_extrinsics.yml"
+},
+"surround_fisheye": {
+  "enabled": true,
+  "calibration_files": {
+    "front": "fisheye_calibration/surround_front_fisheye.yml",
+    "rear": "fisheye_calibration/surround_rear_fisheye.yml",
+    "left": "fisheye_calibration/surround_left_fisheye.yml",
+    "right": "fisheye_calibration/surround_right_fisheye.yml"
+  }
+},
+"key_bindings": {
+  "toggle_fisheye": ["F"]
+}
+```
+
+相对标定路径以 EXE 所在目录为基准，也支持绝对路径。
+标定加载或着色器初始化失败时记录原因并显示原始画面。
+单路标定加载失败时只让该路保持原始画面，其它相机仍可正常矫正。
+
 中文字体默认使用 Windows 的微软雅黑或黑体。Linux 专用 `readelf` / `ldd` 检查在 Windows 上由安装目录启动检查替代，
 并增加 SDK ABI、SDL dummy 音频和 NVDEC 实机测试。可单独运行 `ctest --test-dir build/windows-console -C Release -L hardware --output-on-failure`：测试使用操作台相同的解码工厂，在 GPU 上解码两种分辨率的 H.264 帧并校验 I420 像素和 RTP 时间戳。无需信令服务器、相机或车辆。实际视频帧率、麦克风、方向盘和与车端的网络联调仍需在目标机器验收。
 

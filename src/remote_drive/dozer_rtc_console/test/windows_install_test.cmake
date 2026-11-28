@@ -5,7 +5,8 @@ execute_process(COMMAND "${CMAKE_COMMAND}" --install "${BUILD_DIR}" --config "${
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "Install failed: ${output}${error}")
 endif()
-foreach(name rtc_console.exe vtsrtc.dll rtc.cfg console.cfg)
+foreach(name rtc_console.exe vtsrtc.dll rtc.cfg console.cfg
+    fisheye_calibration/stereo_fisheye_extrinsics.yml)
   if(NOT EXISTS "${prefix}/bin/${name}")
     message(FATAL_ERROR "Missing installed runtime file: ${name}")
   endif()

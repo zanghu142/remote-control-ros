@@ -16,10 +16,15 @@
 namespace webrtc {
 namespace {
 
-bool DriverImportsAvailable() {
+bool InitializeDriver(CUdevice* device, CUcontext* context) {
   __try {
-    return SUCCEEDED(__HrLoadAllImportsForDll("nvcuda.dll")) &&
-           SUCCEEDED(__HrLoadAllImportsForDll("nvcuvid.dll"));
+    // Newer CUDA libraries load nvcuda.dll themselves, without a delay-import
+    // entry. Call the driver API to initialize it; older delay imports remain
+    // protected by the exception handler below.
+    return SUCCEEDED(__HrLoadAllImportsForDll("nvcuvid.dll")) &&
+           cuInit(0) == CUDA_SUCCESS &&
+           cuDeviceGet(device, 0) == CUDA_SUCCESS &&
+           cuDevicePrimaryCtxRetain(context, *device) == CUDA_SUCCESS;
   } __except ((GetExceptionCode() == VcppException(ERROR_SEVERITY_ERROR, ERROR_MOD_NOT_FOUND) ||
                GetExceptionCode() == VcppException(ERROR_SEVERITY_ERROR, ERROR_PROC_NOT_FOUND))
                   ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
@@ -34,9 +39,7 @@ class NvdecH264 final : public VideoDecoder {
   int32_t InitDecode(const VideoCodec* codec, int32_t) override {
     Release();
     if (!codec || codec->codecType != kVideoCodecH264) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
-    if (!DriverImportsAvailable() || cuInit(0) != CUDA_SUCCESS ||
-        cuDeviceGet(&device_, 0) != CUDA_SUCCESS ||
-        cuDevicePrimaryCtxRetain(&context_, device_) != CUDA_SUCCESS) {
+    if (!InitializeDriver(&device_, &context_)) {
       LOG_ERROR("NVDEC: cannot initialize NVIDIA display driver / CUDA device 0");
       return WEBRTC_VIDEO_CODEC_ERROR;
     }

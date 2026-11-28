@@ -20,6 +20,7 @@ struct AppConfig {
   nlohmann::json rtc_settings = nlohmann::json::object();
   std::map<std::string, std::vector<std::string>> key_bindings{
       {"toggle_interleave", {"I"}}, {"toggle_view", {"S"}},
+      {"toggle_fisheye", {"F"}},
       {"select_1", {"1"}}, {"select_2", {"2"}},
       {"select_3", {"3"}}, {"select_4", {"4"}},
       {"takeover", {"C"}}, {"release_takeover", {"Q"}},
@@ -32,6 +33,14 @@ struct AppConfig {
       {"escape", {"Escape"}}};
   std::string room_id = "zhejianglab";
   bool auto_open_room = false;
+  bool stereo_fisheye_enabled = false;
+  std::string stereo_fisheye_calibration = "fisheye_calibration/stereo_fisheye_extrinsics.yml";
+  bool surround_fisheye_enabled = false;
+  std::map<std::string, std::string> surround_fisheye_calibrations{
+      {"front", "fisheye_calibration/surround_front_fisheye.yml"},
+      {"rear", "fisheye_calibration/surround_rear_fisheye.yml"},
+      {"left", "fisheye_calibration/surround_left_fisheye.yml"},
+      {"right", "fisheye_calibration/surround_right_fisheye.yml"}};
   std::array<std::string, 4> device_slots{{"car_1", "car_2", "car_3", "car_4"}};
   double steering_wheel_range_deg = 900.0;
   bool steering_servo_calibrated = false;

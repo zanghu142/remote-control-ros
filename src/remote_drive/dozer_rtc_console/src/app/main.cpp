@@ -13,6 +13,10 @@
 #include "vehicle_control_sender.h"
 #include "vehicle_state_log_limiter.h"
 #include "console_ui.h"
+#include "stereo_fisheye.h"
+#if defined(_WIN32)
+#include "stereo_fisheye_renderer.h"
+#endif
 
 #include <imgui.h>
 #include <backends/imgui_impl_opengl3.h>
@@ -66,6 +70,7 @@ constexpr const char* kSurroundFrontVideoSource = "surround_front";
 constexpr const char* kSurroundRearVideoSource = "surround_rear";
 constexpr const char* kSurroundLeftVideoSource = "surround_left";
 constexpr const char* kSurroundRightVideoSource = "surround_right";
+constexpr const char* kSurroundCameraNames[] = {"front", "rear", "left", "right"};
 constexpr int kAutoOpenRetryMs = 3000;
 constexpr int kNoRenderStatusIntervalMs = 5000;
 constexpr uint64_t kVehicleDriveIntervalMs = 20;
@@ -132,8 +137,12 @@ struct VideoTextureView {
   int width = 0;
   int height = 0;
   uint64_t uploaded_frame_seq = 0;
+#if defined(_WIN32)
+  int uploaded_render_frame = -1;
+#else
   bool uploaded_with_lr_interleave = false;
   std::vector<unsigned char> remapped_buffer;
+#endif
 };
 
 namespace fused = dozer::perception::v1;
@@ -242,6 +251,7 @@ bool VideoTileForSourceId(const std::string& source_id,
   return false;
 }
 
+#if !defined(_WIN32)
 size_t ScaleIndexNearest(size_t dst_index, size_t dst_count, size_t src_count) {
   if (src_count <= 1 || dst_count <= 1) {
     return 0;
@@ -297,6 +307,8 @@ bool RasterizeFrameToRenderedHorizontalInterleave(
 
   return true;
 }
+
+#endif
 
 std::string JoinPath(const std::string& base, const std::string& leaf) {
   if (base.empty()) {
@@ -615,6 +627,43 @@ class RtcConsoleApp {
         rtc_console::LoadConfig(rtc_cfg_path_);
     saved_settings_ = config;
     settings_draft_ = config;
+#if defined(_WIN32)
+    if (!options_.no_render) {
+      const auto calibration_path = [](const std::string& reference) {
+        const bool absolute = !reference.empty() &&
+            (reference[0] == '/' || reference[0] == '\\' ||
+             (reference.size() > 1 && reference[1] == ':'));
+        return absolute ? reference : JoinPath(ExecutableDir(), reference);
+      };
+      const auto& reference = config.stereo_fisheye_calibration;
+      try {
+        fisheye_calibration_ = std::make_unique<rtc_console::StereoFisheyeCalibration>(
+            rtc_console::LoadStereoFisheyeCalibration(calibration_path(reference)));
+        render_fisheye_ = config.stereo_fisheye_enabled;
+        AppendLog(std::string("双目鱼眼标定已加载：") + reference);
+        const auto& crop = fisheye_calibration_->valid_crop;
+        AppendLog("鱼眼黑边裁剪：左右眼共用中心 " +
+            std::to_string(static_cast<int>(std::lround((crop[2] - crop[0]) * 100))) +
+            "% 画幅，保持宽高比");
+      } catch (const std::exception& error) {
+        AppendLog(std::string("双目鱼眼矫正不可用：") + error.what());
+      }
+      for (const auto& entry : config.surround_fisheye_calibrations) {
+        try {
+          auto calibration = std::make_unique<rtc_console::StereoFisheyeCalibration>(
+              rtc_console::LoadSingleFisheyeCalibration(calibration_path(entry.second)));
+          const auto& crop = calibration->valid_crop;
+          AppendLog(std::string("环视鱼眼标定已加载：") + entry.first + "，中心保留 " +
+              std::to_string(static_cast<int>(std::lround((crop[2] - crop[0]) * 100))) + "%");
+          surround_fisheye_calibrations_.emplace(entry.first, std::move(calibration));
+        } catch (const std::exception& error) {
+          AppendLog("环视 " + entry.first + " 鱼眼矫正不可用：" + error.what());
+        }
+      }
+      render_surround_fisheye_ = config.surround_fisheye_enabled &&
+          !surround_fisheye_calibrations_.empty();
+    }
+#endif
     if (!options_.room_id_from_command_line) {
       options_.room_id = config.room_id;
       std::snprintf(open_room_id_, sizeof(open_room_id_), "%s",
@@ -728,6 +777,15 @@ class RtcConsoleApp {
       ImGui_ImplOpenGL3_NewFrame();
       ImGui::NewFrame();
 
+#if defined(_WIN32)
+      fisheye_renderer_.BeginFrame();
+      if ((render_fisheye_ || render_surround_fisheye_) && !fisheye_renderer_.Error().empty()) {
+        render_fisheye_ = false;
+        render_surround_fisheye_ = false;
+        AppendLog(std::string("鱼眼矫正已关闭，GPU 初始化失败：") + fisheye_renderer_.Error());
+      }
+#endif
+
       DrawUi();
       TickVehicleControl(SteadyTimeMs());
 
@@ -742,6 +800,9 @@ class RtcConsoleApp {
     }
 
     ReleaseVideoTextures();
+#if defined(_WIN32)
+    fisheye_renderer_.Shutdown();
+#endif
     ui_window_ = nullptr;
     CloseGamepad();
     ImGui_ImplSDL3_Shutdown();
@@ -1291,6 +1352,22 @@ class RtcConsoleApp {
     if (settings_category_ == 0) {
       SettingsField("房间", [&] { SettingsText("##room", &settings_draft_.room_id); });
       ImGui::Checkbox("自动创建房间", &settings_draft_.auto_open_room);
+#if defined(_WIN32)
+      ImGui::Separator();
+      ImGui::Checkbox("启动时启用双目鱼眼矫正", &settings_draft_.stereo_fisheye_enabled);
+      SettingsField("双目鱼眼标定文件", [&] {
+        SettingsText("##fisheye_file", &settings_draft_.stereo_fisheye_calibration);
+      });
+      ImGui::Checkbox("启动时启用环视鱼眼矫正", &settings_draft_.surround_fisheye_enabled);
+      for (auto& entry : settings_draft_.surround_fisheye_calibrations) {
+        const std::string source = "surround_" + entry.first;
+        const std::string label = std::string(ui::SettingLabel(source)) + "标定文件";
+        SettingsField(label.c_str(), [&] {
+          SettingsText("##file", &entry.second);
+        });
+      }
+      ImGui::TextDisabled("原始／矫正切换：%s", ActionKeyLabel("toggle_fisheye"));
+#endif
     }
     if (settings_category_ == 1) {
       const char* labels[] = {"左上设备", "右上设备", "左下设备", "右下设备"};
@@ -1804,6 +1881,20 @@ class RtcConsoleApp {
   }
 
   void UpdateVehicleInputFromKeyboard() {
+#if defined(_WIN32)
+    if (!ImGui::GetIO().WantTextInput && ActionPressed("toggle_fisheye")) {
+      if ((!fisheye_calibration_ && surround_fisheye_calibrations_.empty()) ||
+          !fisheye_renderer_.Error().empty()) {
+        AppendLog("无法启用鱼眼矫正，请检查标定文件和 GPU 初始化日志");
+      } else {
+        const bool enable = !(render_fisheye_ || render_surround_fisheye_);
+        render_fisheye_ = enable && fisheye_calibration_ != nullptr;
+        render_surround_fisheye_ = enable && !surround_fisheye_calibrations_.empty();
+        fisheye_hint_until_ms_ = SteadyTimeMs() + 1500;
+        AppendLog(enable ? "双目／环视显示：鱼眼矫正画面" : "双目／环视显示：原始画面");
+      }
+    }
+#endif
     if (ActionPressed("toggle_interleave")) {
       render_lr_pixel_interleave_ = !render_lr_pixel_interleave_;
     }
@@ -2967,15 +3058,31 @@ class RtcConsoleApp {
     const float title_height = video_debug_enabled_ ? std::min(box_size.y - 1.0f,
       ImGui::GetTextLineHeight() + title_padding * 2.0f) : 0.0f;
     const float image_area_height = std::max(1.0f, box_size.y - title_height);
-    const bool render_lr_pixel_interleave =
-        render_lr_pixel_interleave_ && frame.source_id == kExternalVideoSource;
+    size_t source_width = frame.width, source_height = frame.height;
+#if defined(_WIN32)
+    UpdateTextureFromFrame(frame);
+    const auto frozen_texture = video_textures_.find(frame.stream_key);
+    if (frozen_texture != video_textures_.end() && frozen_texture->second.texture != 0) {
+      // Resolution changes between decode callbacks must not change the layout
+      // or shader map of a texture already used by this UI frame.
+      source_width = static_cast<size_t>(frozen_texture->second.width);
+      source_height = static_cast<size_t>(frozen_texture->second.height);
+    }
+#endif
+    const bool stereo_single_eye = frame.source_id == kExternalVideoSource &&
+        (uv_max.x <= 0.5f || uv_min.x >= 0.5f);
+    bool render_lr_pixel_interleave =
+        render_lr_pixel_interleave_ && frame.source_id == kExternalVideoSource && !stereo_single_eye;
+#if defined(_WIN32)
+    render_lr_pixel_interleave = render_lr_pixel_interleave && fisheye_renderer_.Error().empty();
+#endif
     float draw_width = box_size.x;
     float draw_height = image_area_height;
-    if (frame.width > 0 && frame.height > 0) {
+    if (source_width > 0 && source_height > 0) {
       const float src_aspect =
-          static_cast<float>(frame.width) *
+          static_cast<float>(source_width) *
           (render_lr_pixel_interleave ? 0.5f : 1.0f) * (uv_max.x - uv_min.x) /
-          (static_cast<float>(frame.height) * (uv_max.y - uv_min.y));
+          (static_cast<float>(source_height) * (uv_max.y - uv_min.y));
       const float box_aspect = box_size.x / image_area_height;
       if (src_aspect > box_aspect) {
         draw_height = box_size.x / src_aspect;
@@ -3000,8 +3107,10 @@ class RtcConsoleApp {
       draw_height = static_cast<float>(render_height_pixels) / fb_scale_y;
     }
 
+#if !defined(_WIN32)
     UpdateTextureFromFrame(frame, render_lr_pixel_interleave,
                            render_width_pixels, render_height_pixels);
+#endif
 
     const auto tex_it = video_textures_.find(frame.stream_key);
     if (tex_it == video_textures_.end() || tex_it->second.texture == 0) {
@@ -3063,28 +3172,77 @@ class RtcConsoleApp {
                   << std::endl;
       }
     }
+    const bool image_hovered = ImGui::IsWindowHovered() &&
+        ImGui::IsMouseHoveringRect(image_min, image_max);
+    const bool show_image_hints = !fullscreen_mode && image_hovered &&
+        draw_width > 100 && draw_height > 50;
     draw_list->PushClipRect(box_min, box_max, true);
-    draw_list->AddImage((ImTextureID)(intptr_t)tex_it->second.texture, image_min,
-                        image_max, uv_min, uv_max);
+#if defined(_WIN32)
+    bool corrected_display = false;
+    if (UseFisheyeForFrame(frame)) {
+      corrected_display = DrawFisheyeFrame(frame, draw_list,
+          (ImTextureID)(intptr_t)tex_it->second.texture,
+          image_min, image_max, uv_min, uv_max, render_lr_pixel_interleave,
+          tex_it->second.width, tex_it->second.height);
+    } else if (render_lr_pixel_interleave) {
+      // All Windows views sample the SAME original texture; interleaving never
+      // mutates it, so a later fullscreen/eye draw cannot corrupt earlier draws.
+      fisheye_renderer_.DrawImage(draw_list, (ImTextureID)(intptr_t)tex_it->second.texture,
+          image_min, image_max, uv_min, uv_max, nullptr,
+          static_cast<int>(tex_it->second.width / 2), tex_it->second.height, true);
+    } else
+#endif
+    {
+      draw_list->AddImage((ImTextureID)(intptr_t)tex_it->second.texture, image_min,
+                          image_max, uv_min, uv_max);
+    }
     DrawVisionDetectionOverlay(frame, image_min, image_max, draw_list,
+#if defined(_WIN32)
+                               render_lr_pixel_interleave,
+#else
                                tex_it->second.uploaded_with_lr_interleave,
+#endif
                                NormalizedRect{uv_min.x, uv_min.y,
                                               uv_max.x, uv_max.y});
+#if defined(_WIN32)
+    if ((show_image_hints || SteadyTimeMs() < fisheye_hint_until_ms_) &&
+        (frame.source_id == kExternalVideoSource ||
+        frame.source_id.find("surround_") == 0)) {
+      const std::string label = (corrected_display ? "鱼眼矫正  " : "原始画面  ") +
+          ActionKeyLabel("toggle_fisheye");
+      const ImVec2 hint_min(image_min.x + 8, image_min.y + 8);
+      const float padding_x = ImGui::GetStyle().FramePadding.x;
+      const ImVec2 text_min(hint_min.x + padding_x, hint_min.y);
+      const ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+      draw_list->AddRectFilled(hint_min,
+          ImVec2(text_min.x + text_size.x + padding_x, text_min.y + text_size.y),
+          ImGui::GetColorU32(ImVec4(0.05f, 0.07f, 0.09f, 0.90f)),
+          ImGui::GetStyle().FrameRounding);
+      draw_list->AddText(text_min, ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
+    }
+#endif
     draw_list->PopClipRect();
     draw_list->AddRect(box_min, box_max,
                IM_COL32(80, 80, 80, 255));
 
-    const bool image_hovered = ImGui::IsWindowHovered() &&
-        ImGui::IsMouseHoveringRect(image_min, image_max);
     if (image_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
       // 同一帧会继续绘制新打开的全屏视图，不能将同一次双击当作退出。
-      if (!fullscreen_mode) {
+      const bool can_open_eye = frame.source_id == kExternalVideoSource &&
+          !render_lr_pixel_interleave && !stereo_single_eye;
+      if (can_open_eye && (!fullscreen_mode || ImGui::GetFrameCount() > fullscreen_open_frame_)) {
+        const float mouse_u = uv_min.x +
+            (ImGui::GetIO().MousePos.x - image_min.x) / (image_max.x - image_min.x) *
+            (uv_max.x - uv_min.x);
+        const bool right_eye = mouse_u >= 0.5f;
+        OpenFullscreenVideo(frame, ImVec2(right_eye ? 0.5f : 0.0f, uv_min.y),
+            ImVec2(right_eye ? 1.0f : 0.5f, uv_max.y), right_eye ? "双目右眼" : "双目左眼");
+      } else if (!fullscreen_mode) {
         OpenFullscreenVideo(frame, uv_min, uv_max, tile_label);
       } else if (ImGui::GetFrameCount() > fullscreen_open_frame_) {
         ExitFullscreenView();
       }
     }
-    if (!fullscreen_mode && image_hovered && draw_width > 100 && draw_height > 50) {
+    if (show_image_hints) {
       const ImVec2 cursor = ImGui::GetCursorScreenPos();
       ImGui::PushID(frame.stream_key.c_str());
       ImGui::PushID(tile_label ? tile_label : "frame");
@@ -3093,7 +3251,11 @@ class RtcConsoleApp {
       if (ImGui::SmallButton("全屏")) {
         OpenFullscreenVideo(frame, uv_min, uv_max, tile_label);
       }
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("双击画面也可全屏观看");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(frame.source_id == kExternalVideoSource && !render_lr_pixel_interleave
+            ? "双击左眼或右眼可单独放大；此按钮全屏显示双目"
+            : "双击画面也可全屏观看");
+      }
       ImGui::PopStyleColor();
       ImGui::SetCursorScreenPos(cursor);
       ImGui::PopID();
@@ -3406,6 +3568,9 @@ class RtcConsoleApp {
       if (!DetectionToNormalizedRect(detection, frame, &source_rect)) {
         continue;
       }
+      if (UseFisheyeForFrame(frame) && !RectifyDetectionRect(frame, &source_rect)) {
+        continue;
+      }
 
       char label[64] = {0};
       if (detection.has_3d()) {
@@ -3468,8 +3633,9 @@ class RtcConsoleApp {
         ? "正在接管：" + DeviceLabel(vehicle_control_targets_.selected_target())
         : fullscreen_video_.mode() == rtc_console::VideoFullscreenState::Mode::Monitor
             ? "全屏监看" : ui::SettingLabel(fullscreen_video_.label());
-    const std::string exit_label = (fullscreen_video_.returns_to_monitor()
-        ? "返回监看  " : "退出全屏  ") + ActionKeyLabel("escape");
+    const std::string exit_label = (fullscreen_video_.returns_to_stream() ? "返回双目  " :
+        fullscreen_video_.returns_to_monitor() ? "返回监看  " : "退出全屏  ") +
+        ActionKeyLabel("escape");
     const float width = ImGui::CalcTextSize(status.c_str()).x +
         ImGui::CalcTextSize(exit_label.c_str()).x + ImGui::GetStyle().FramePadding.x * 2 +
         ImGui::GetStyle().ItemSpacing.x + 24;
@@ -3604,10 +3770,144 @@ class RtcConsoleApp {
     }
   }
 
-  void UpdateTextureFromFrame(const VideoFrameView& frame,
-                              bool render_lr_pixel_interleave,
-                              int render_width_pixels,
-                              int render_height_pixels) {
+  const rtc_console::StereoFisheyeCalibration* SurroundFisheye(const std::string& camera) const {
+#if defined(_WIN32)
+    const auto found = surround_fisheye_calibrations_.find(camera);
+    return found == surround_fisheye_calibrations_.end() ? nullptr : found->second.get();
+#else
+    return nullptr;
+#endif
+  }
+
+  bool UseFisheyeForFrame(const VideoFrameView& frame) const {
+#if defined(_WIN32)
+    if (!fisheye_renderer_.Error().empty() || frame.width == 0 || frame.height == 0) return false;
+    if (frame.source_id == kExternalVideoSource)
+      return render_fisheye_ && fisheye_calibration_ && frame.width >= 2 && frame.width % 2 == 0;
+    if (!render_surround_fisheye_) return false;
+    if (frame.source_id == "surround_grid")
+      return !surround_fisheye_calibrations_.empty() && frame.width >= 2 && frame.height >= 2 &&
+          frame.width % 2 == 0 && frame.height % 2 == 0;
+    return frame.source_id.find("surround_") == 0 &&
+        SurroundFisheye(frame.source_id.substr(9)) != nullptr;
+#else
+    return false;
+#endif
+  }
+
+#if defined(_WIN32)
+  bool DrawFisheyeFrame(const VideoFrameView& frame, ImDrawList* list, ImTextureID texture,
+                       ImVec2 min, ImVec2 max, ImVec2 uv_min, ImVec2 uv_max, bool interleave,
+                       int texture_width, int texture_height) {
+    if (frame.source_id == kExternalVideoSource) {
+      fisheye_renderer_.DrawImage(list, texture, min, max, uv_min, uv_max, fisheye_calibration_.get(),
+          texture_width / 2, texture_height, interleave);
+      return true;
+    }
+    if (frame.source_id != "surround_grid") {
+      const auto* calibration = SurroundFisheye(frame.source_id.substr(9));
+      if (!calibration) {
+        list->AddImage(texture, min, max, uv_min, uv_max);
+        return false;
+      }
+      fisheye_renderer_.DrawImage(list, texture, min, max, uv_min, uv_max, calibration,
+          texture_width, texture_height, false, true);
+      return true;
+    }
+
+    bool corrected = false;
+    // Handle both a complete grid and a tile/fullscreen crop from that grid.
+    // Geometry and texture coordinates remain in the original grid's space;
+    // the shader maps into each camera's local space before applying K/D/new_K.
+    for (int index = 0; index < 4; ++index) {
+      const float left = (index % 2) * 0.5f, top = (index / 2) * 0.5f;
+      const ImVec2 clipped_min(std::max(uv_min.x, left), std::max(uv_min.y, top));
+      const ImVec2 clipped_max(std::min(uv_max.x, left + 0.5f), std::min(uv_max.y, top + 0.5f));
+      if (clipped_min.x >= clipped_max.x || clipped_min.y >= clipped_max.y) continue;
+      const auto position = [&](ImVec2 uv) {
+        return ImVec2(min.x + (uv.x - uv_min.x) / (uv_max.x - uv_min.x) * (max.x - min.x),
+                      min.y + (uv.y - uv_min.y) / (uv_max.y - uv_min.y) * (max.y - min.y));
+      };
+      const auto* calibration = SurroundFisheye(kSurroundCameraNames[index]);
+      if (!calibration) {
+        list->AddImage(texture, position(clipped_min), position(clipped_max), clipped_min, clipped_max);
+        continue;
+      }
+      fisheye_renderer_.DrawImage(list, texture, position(clipped_min), position(clipped_max),
+          clipped_min, clipped_max, calibration, texture_width / 2,
+          texture_height / 2, false, true, {{left, top, left + 0.5f, top + 0.5f}});
+      corrected = true;
+    }
+    return corrected;
+  }
+#endif
+
+  bool RectifyDetectionRect(const VideoFrameView& frame, NormalizedRect* rect) const {
+#if defined(_WIN32)
+    const rtc_console::StereoFisheyeCalibration* selected = nullptr;
+    int eye = 0;
+    double origin_x = 0, origin_y = 0, region_width = 1, region_height = 1;
+    if (frame.source_id == kExternalVideoSource) {
+      selected = fisheye_calibration_.get();
+      eye = (rect->left + rect->right) * 0.5f >= 0.5f ? 1 : 0;
+      region_width = 0.5;
+      origin_x = eye * 0.5;
+    } else if (frame.source_id == "surround_grid") {
+      const int column = std::clamp(static_cast<int>(rect->left + rect->right), 0, 1);
+      const int row = std::clamp(static_cast<int>(rect->top + rect->bottom), 0, 1);
+      selected = SurroundFisheye(kSurroundCameraNames[row * 2 + column]);
+      origin_x = column * 0.5; origin_y = row * 0.5;
+      region_width = region_height = 0.5;
+    } else if (frame.source_id.find("surround_") == 0) {
+      selected = SurroundFisheye(frame.source_id.substr(9));
+    }
+    // A missing camera calibration falls back to raw rendering and raw overlays.
+    if (!selected) return true;
+    const auto& calibration = *selected;
+    const NormalizedRect source{
+        static_cast<float>(std::max<double>(rect->left, origin_x)),
+        static_cast<float>(std::max<double>(rect->top, origin_y)),
+        static_cast<float>(std::min<double>(rect->right, origin_x + region_width)),
+        static_cast<float>(std::min<double>(rect->bottom, origin_y + region_height))};
+    if (source.right <= source.left || source.bottom <= source.top) return false;
+    double min_x = 1, min_y = 1, max_x = 0, max_y = 0;
+    bool found = false;
+    for (int edge = 0; edge < 4; ++edge) {
+      for (int step = 0; step <= 8; ++step) {
+        const double t = step / 8.0;
+        const double x = edge < 2 ? source.left + t * (source.right - source.left) :
+            edge == 2 ? source.left : source.right;
+        const double y = edge >= 2 ? source.top + t * (source.bottom - source.top) :
+            edge == 0 ? source.top : source.bottom;
+        double rx = 0, ry = 0;
+        if (!rtc_console::FisheyeRectifiedPoint(calibration.eyes[eye],
+            (x - origin_x) / region_width * calibration.width - 0.5,
+            (y - origin_y) / region_height * calibration.height - 0.5, &rx, &ry)) continue;
+        const auto& crop = calibration.valid_crop;
+        rx = ((rx + 0.5) / calibration.width - crop[0]) / (crop[2] - crop[0]);
+        ry = ((ry + 0.5) / calibration.height - crop[1]) / (crop[3] - crop[1]);
+        min_x = std::min(min_x, rx); max_x = std::max(max_x, rx);
+        min_y = std::min(min_y, ry); max_y = std::max(max_y, ry);
+        found = true;
+      }
+    }
+    if (!found || max_x <= 0 || min_x >= 1 || max_y <= 0 || min_y >= 1) return false;
+    *rect = {static_cast<float>(origin_x + std::clamp(min_x, 0.0, 1.0) * region_width),
+             static_cast<float>(origin_y + std::clamp(min_y, 0.0, 1.0) * region_height),
+             static_cast<float>(origin_x + std::clamp(max_x, 0.0, 1.0) * region_width),
+             static_cast<float>(origin_y + std::clamp(max_y, 0.0, 1.0) * region_height)};
+    return true;
+#else
+    return false;
+#endif
+  }
+
+#if defined(_WIN32)
+  void UpdateTextureFromFrame(const VideoFrameView& frame) {
+#else
+  void UpdateTextureFromFrame(const VideoFrameView& frame, bool render_lr_pixel_interleave,
+                              int render_width_pixels, int render_height_pixels) {
+#endif
     if (frame.buffer.empty() || frame.width == 0 || frame.height == 0 ||
         frame.dimension < 4) {
       return;
@@ -3624,14 +3924,25 @@ class RtcConsoleApp {
       texture_view.width = 0;
       texture_view.height = 0;
       texture_view.uploaded_frame_seq = 0;
+#if !defined(_WIN32)
       texture_view.uploaded_with_lr_interleave = false;
+#endif
     }
 
     const unsigned char* upload_data = frame.buffer.data();
-    bool uploaded_with_lr_interleave = false;
     int upload_width = static_cast<int>(frame.width);
     int upload_height = static_cast<int>(frame.height);
-    if (render_lr_pixel_interleave &&
+#if defined(_WIN32)
+    // ImGui executes draw commands later. Freeze each stream texture for this
+    // entire UI frame, even if a newer decode arrives between panel/fullscreen.
+    const int render_frame = ImGui::GetFrameCount();
+    if (texture_view.uploaded_render_frame == render_frame) return;
+    texture_view.uploaded_render_frame = render_frame;
+    if (texture_view.uploaded_frame_seq == frame.frame_seq &&
+        texture_view.width == upload_width && texture_view.height == upload_height) return;
+#else
+    bool uploaded_with_lr_interleave = false;
+    if (render_lr_pixel_interleave && !UseFisheyeForFrame(frame) &&
         render_width_pixels > 0 && render_height_pixels > 0 &&
         RasterizeFrameToRenderedHorizontalInterleave(
             frame, static_cast<size_t>(render_width_pixels),
@@ -3648,12 +3959,18 @@ class RtcConsoleApp {
         texture_view.width == upload_width && texture_view.height == upload_height) {
       return;
     }
+#endif
 
     glBindTexture(GL_TEXTURE_2D, texture_view.texture);
+#if defined(_WIN32)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+#else
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                     uploaded_with_lr_interleave ? GL_NEAREST : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
                     uploaded_with_lr_interleave ? GL_NEAREST : GL_LINEAR);
+#endif
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -3670,7 +3987,9 @@ class RtcConsoleApp {
 
     glBindTexture(GL_TEXTURE_2D, 0);
     texture_view.uploaded_frame_seq = frame.frame_seq;
+#if !defined(_WIN32)
     texture_view.uploaded_with_lr_interleave = uploaded_with_lr_interleave;
+#endif
   }
 
   void ReleaseVideoTextures() {
@@ -4460,6 +4779,9 @@ class RtcConsoleApp {
     }
 
     instance_->remote_video_frames_.fetch_add(1);
+    // The SDK callback buffer is borrowed. Keep one owned copy only when a
+    // renderer needs it; never retain the callback pointer after returning.
+    if (instance_->options_.no_render) return;
     if (!sourceid || !buffer || width == 0 || height == 0 || sz_buffer == 0) {
       return;
     }
@@ -4473,8 +4795,6 @@ class RtcConsoleApp {
     view->dimension = dimension;
     view->frame_seq = instance_->remote_video_frame_seq_.fetch_add(1) + 1;
     view->buffer.assign(buffer, buffer + sz_buffer);
-
-    if (instance_->options_.no_render) return;
 
     {
       std::lock_guard<std::mutex> lock(instance_->video_mutex_);
@@ -4613,6 +4933,15 @@ class RtcConsoleApp {
   std::mutex edge_feedback_mutex_;
   std::map<uint32_t, EdgeFeedbackView> edge_feedback_by_session_;
   bool render_lr_pixel_interleave_ = false;
+#if defined(_WIN32)
+  std::unique_ptr<rtc_console::StereoFisheyeCalibration> fisheye_calibration_;
+  std::map<std::string, std::unique_ptr<rtc_console::StereoFisheyeCalibration>>
+      surround_fisheye_calibrations_;
+  rtc_console::StereoFisheyeRenderer fisheye_renderer_;
+  bool render_fisheye_ = false;
+  bool render_surround_fisheye_ = false;
+  uint64_t fisheye_hint_until_ms_ = 0;
+#endif
   std::map<RtcSessionId, uint64_t> video_view_frame_thresholds_;
   rtc_console::VideoViewState video_view_state_;
   rtc_console::VideoFullscreenState fullscreen_video_;

@@ -65,6 +65,32 @@ static AppConfig ParseConfig(const nlohmann::json& root) {
   if (!console.is_object()) {
     throw std::runtime_error("config field must be an object: console");
   }
+  if (console.contains("stereo_fisheye")) {
+    const auto& fisheye = console.at("stereo_fisheye");
+    if (!fisheye.is_object() || !fisheye.contains("enabled") ||
+        !fisheye.at("enabled").is_boolean() || !fisheye.contains("calibration_file") ||
+        !fisheye.at("calibration_file").is_string() ||
+        fisheye.at("calibration_file").get<std::string>().empty()) {
+      throw std::runtime_error("console.stereo_fisheye requires enabled and calibration_file");
+    }
+    config.stereo_fisheye_enabled = fisheye.at("enabled").get<bool>();
+    config.stereo_fisheye_calibration = fisheye.at("calibration_file").get<std::string>();
+  }
+  if (console.contains("surround_fisheye")) {
+    const auto& fisheye = console.at("surround_fisheye");
+    if (!fisheye.is_object() || !fisheye.contains("enabled") ||
+        !fisheye.at("enabled").is_boolean() || !fisheye.contains("calibration_files") ||
+        !fisheye.at("calibration_files").is_object())
+      throw std::runtime_error("console.surround_fisheye requires enabled and calibration_files");
+    config.surround_fisheye_enabled = fisheye.at("enabled").get<bool>();
+    const auto& files = fisheye.at("calibration_files");
+    for (auto& entry : config.surround_fisheye_calibrations) {
+      if (!files.contains(entry.first) || !files.at(entry.first).is_string() ||
+          files.at(entry.first).get<std::string>().empty())
+        throw std::runtime_error("Missing or invalid surround calibration_file: " + entry.first);
+      entry.second = files.at(entry.first).get<std::string>();
+    }
+  }
   if (console.contains("key_bindings")) {
     const auto& bindings = console.at("key_bindings");
     if (!bindings.is_object()) {
@@ -219,6 +245,10 @@ void SaveConfig(const std::string& config_path, const AppConfig& config) {
   }
   nlohmann::json section = {
       {"room", config.room_id}, {"auto_open_room", config.auto_open_room},
+      {"stereo_fisheye", {{"enabled", config.stereo_fisheye_enabled},
+                          {"calibration_file", config.stereo_fisheye_calibration}}},
+      {"surround_fisheye", {{"enabled", config.surround_fisheye_enabled},
+                            {"calibration_files", config.surround_fisheye_calibrations}}},
       {"device_slots", config.device_slots},
       {"key_bindings", config.key_bindings},
       {"steering", {{"wheel_range_deg", config.steering_wheel_range_deg}}}};

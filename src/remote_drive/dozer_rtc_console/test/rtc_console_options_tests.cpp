@@ -148,7 +148,7 @@ void TestKeyBindings() {
   const auto defaults = rtc_console::LoadConfig(path);
   Check(defaults.key_bindings.at("forward") == std::vector<std::string>{"UpArrow"},
     "preserve default driving keys");
-  Check(defaults.key_bindings.size() == 21, "cover all application keyboard actions");
+  Check(defaults.key_bindings.size() == 22, "cover all application keyboard actions");
   WriteConfig(path, "{\"console\":{\"key_bindings\":{\"forward\":[\"W\",\"F1\"],\"takeover\":\"T\"}}}");
   const auto changed = rtc_console::LoadConfig(path);
   Check(changed.key_bindings.at("forward") == std::vector<std::string>({"W", "F1"}) &&

@@ -22,6 +22,7 @@ target_include_directories(console_options PUBLIC "${app}")
 target_link_libraries(console_options PUBLIC dozer_rtc_common::dozer_rtc_common)
 
 add_library(console_support STATIC
+  "${app}/stereo_fisheye.cpp"
   "${app}/video_composite_layout.cpp"
   "${app}/video_detection_overlay.cpp"
   "${app}/video_view_state.cpp"
@@ -34,6 +35,7 @@ target_link_libraries(rtc_console PRIVATE console_support dozer_audio::dozer_aud
   dozer_rtc_sdk::vtsrtc imgui::imgui OpenGL::GL ${CMAKE_DL_LIBS})
 target_compile_definitions(rtc_console PRIVATE DOZER_RTC_HAS_VIDEO_DELAY_STATS=1)
 if(WIN32)
+  target_sources(rtc_console PRIVATE "${app}/stereo_fisheye_renderer.cpp")
   target_link_libraries(rtc_console PRIVATE dwmapi)
   target_sources(rtc_console PRIVATE "${app}/rtc_console.manifest")
   set(console_install_dir bin)
@@ -54,6 +56,26 @@ foreach(config_name rtc.cfg console.cfg)
 endforeach()
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/rtc.cfg" "${CMAKE_CURRENT_BINARY_DIR}/console.cfg"
   DESTINATION ${console_install_dir} COMPONENT Runtime)
+
+if(WIN32)
+  set(fisheye_calibrations
+    "${rtc_config_dir}/../stereo_fisheye_extrinsics.yml"
+    "${rtc_config_dir}/../surround_front_fisheye.yml"
+    "${rtc_config_dir}/../surround_rear_fisheye.yml"
+    "${rtc_config_dir}/../surround_left_fisheye.yml"
+    "${rtc_config_dir}/../surround_right_fisheye.yml")
+  set(fisheye_calibration_output "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/fisheye_calibration")
+  # Run on incremental builds too: updated or deleted calibration copies must
+  # be refreshed even when rtc_console.exe itself does not need relinking.
+  add_custom_target(rtc_console_calibration
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${fisheye_calibration_output}"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${fisheye_calibrations}
+      "${fisheye_calibration_output}"
+    VERBATIM)
+  add_dependencies(rtc_console rtc_console_calibration)
+  install(FILES ${fisheye_calibrations}
+    DESTINATION "${console_install_dir}/fisheye_calibration" COMPONENT Runtime)
+endif()
 
 if(BUILD_TESTING)
   enable_testing()
